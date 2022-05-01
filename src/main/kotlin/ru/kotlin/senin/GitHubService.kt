@@ -100,3 +100,7 @@ fun createGitHubService(username: String, password: String): GitHubService {
         .build()
     return retrofit.create(GitHubService::class.java)
 }
+
+fun <T> Response<List<T>>.bodyList(): List<T> {
+    return body() ?: listOf()
+}

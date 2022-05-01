@@ -1,6 +1,7 @@
 package ru.kotlin.senin
 
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import ru.kotlin.senin.GitHubRepositoryStatistics.LoadingStatus.*
@@ -20,12 +21,17 @@ import kotlin.system.exitProcess
 val log: Logger = LoggerFactory.getLogger("AppUI")
 private val defaultInsets = Insets(3, 10, 3, 10)
 
-
 data class UserStatistics(
     val commits: Int,
     val files: Set<String>,
     val changes: Int
-)
+) {
+    operator fun plus(other: UserStatistics) = UserStatistics(
+            commits + other.commits,
+            files + other.files,
+            changes + other.changes
+    )
+}
 
 fun main() {
     setDefaultFontSize(18f)
@@ -87,7 +93,10 @@ class GitHubRepositoryStatistics : JFrame("GitHub Repository Statistics"), Corou
         }.setUpCancellation()
     }
 
-    private fun parseRepositoryUrl(repositoryUrl: String): Pair<String, String> = TODO("Implement me!")
+    private fun parseRepositoryUrl(repositoryUrl: String): Pair<String, String> {
+        val tokens = repositoryUrl.split('/')
+        return Pair(tokens[tokens.lastIndex - 1], tokens.last())
+    }
 
     private fun clearResults() {
         updateResults(emptyMap())
@@ -101,6 +110,13 @@ class GitHubRepositoryStatistics : JFrame("GitHub Repository Statistics"), Corou
         if (completed) {
             setActionsStatus(newLoadingEnabled = true)
         }
+    }
+
+    private fun updateResults(results: Map<String, UserStatistics>) {
+        val sorted = results.toList().sortedByDescending { it.second.commits }
+        resultsModel.setDataVector(sorted.map { (login, stat) ->
+            arrayOf(login, stat.commits, stat.files.size, stat.changes)
+        }.toTypedArray(), columns)
     }
 
     private fun updateLoadingStatus(status: LoadingStatus, startTime: Long? = null) {
@@ -119,9 +135,24 @@ class GitHubRepositoryStatistics : JFrame("GitHub Repository Statistics"), Corou
     }
 
     private fun Job.setUpCancellation() {
-        // TODO: make active the 'cancel' button
-        // TODO: cancel the loading job if the 'cancel' button was clicked
-        // TODO: update the status and remove the listener after the loading job is completed
+        // make active the 'cancel' button
+        setActionsStatus(newLoadingEnabled = false, cancellationEnabled = true)
+
+        val loadingJob = this
+
+        // cancel the loading job if the 'cancel' button was clicked
+        val listener = ActionListener {
+            loadingJob.cancel()
+            updateLoadingStatus(CANCELED)
+        }
+        addCancelListener(listener)
+
+        // update the status and remove the listener after the loading job is completed
+        launch {
+            loadingJob.join()
+            setActionsStatus(newLoadingEnabled = true)
+            removeCancelListener(listener)
+        }
     }
 
     private fun loadInitialParameters() {
@@ -174,13 +205,6 @@ class GitHubRepositoryStatistics : JFrame("GitHub Repository Statistics"), Corou
 
         // Initialize actions
         init()
-    }
-
-    private fun updateResults(results: Map<String, UserStatistics>) {
-        // TODO: Sort results by number of commits!
-        resultsModel.setDataVector(results.map { (login, stat) ->
-            arrayOf(login, stat.commits, stat.files.size, stat.changes)
-        }.toTypedArray(), columns)
     }
 
     private fun setLoadingStatus(text: String, iconRunning: Boolean) {
@@ -293,6 +317,41 @@ fun saveParameters(storedParameters: StoredParameters) {
 suspend fun loadResults(
     service: GitHubService, req: RequestData,
     updateResults: suspend (Map<String, UserStatistics>, completed: Boolean) -> Unit): Unit = coroutineScope {
-    TODO("Implement me!")
+    val commits = service.getCommits(req.owner, req.repository)
+        .also { logCommits(req, it) }
+        .bodyList()
+        .filterNot { it.author?.type == "Bot" }
+
+    val channel = Channel<CommitWithChanges>()
+    for (commit in commits) {
+        launch {
+            val changes = service.getChanges(req.owner, req.repository, commit.sha)
+                .also { logChanges(commit, it) }
+                .body()
+
+            if (changes != null)
+                channel.send(changes)
+        }
+    }
+
+    val results = mutableMapOf<String, UserStatistics>()
+    repeat(commits.size) {
+        val (author, userStat) = channel.receive().extractUserStat()
+        if (author == null)
+            return@repeat
+
+        results[author] =
+            results.getOrDefault(author, UserStatistics(0, setOf(), 0)) + userStat
+
+        updateResults(results, it == commits.lastIndex)
+    }
 }
 
+private fun CommitWithChanges.extractUserStat(): Pair<String?, UserStatistics> =
+    Pair(author?.login,
+        UserStatistics(
+            1,
+            files.map { it.filename }.toSet(),
+            files.sumOf { it.changes }
+        )
+    )
